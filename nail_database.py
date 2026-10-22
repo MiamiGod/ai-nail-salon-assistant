@@ -2,26 +2,39 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VIETNAM_TZ = timezone(timedelta(hours=7))
-
+SALON_TZ = timezone(timedelta(hours=7))
 DB_PATH = Path(__file__).resolve().parent / "nail_bookings.db"
-
-
-def salon_now():
-    return datetime.now(VIETNAM_TZ).replace(tzinfo=None)
-
-
 SERVICES = {
     "Маникюр": 500,
     "Маникюр с покрытием": 800,
     "Наращивание ногтей": 1500,
     "Снятие гель-лака": 300,
 }
-
 DURATION = timedelta(minutes=90)
+OPEN_TIME = "09:00"
+CLOSE_TIME = "20:00"
+
+
+def salon_now():
+    return datetime.now(SALON_TZ).replace(tzinfo=None)
+
+
+def _parse_date(value):
+    parsed = datetime.strptime(value, "%d.%m.%Y").date()
+    if value != parsed.strftime("%d.%m.%Y"):
+        raise ValueError("Неверный формат даты.")
+    return parsed
+
+
+def _parse_time(value):
+    parsed = datetime.strptime(value, "%H:%M").time()
+    if value != parsed.strftime("%H:%M"):
+        raise ValueError("Неверный формат времени.")
+    return parsed
 
 
 def init_db():
+    # Совместимо со старой схемой; существующие записи и их ID не меняются.
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute("""
             CREATE TABLE IF NOT EXISTS bookings (
@@ -33,227 +46,104 @@ def init_db():
                 UNIQUE(date, time)
             )
         """)
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(bookings)")}
+        if "telegram_id" not in columns:
+            connection.execute("ALTER TABLE bookings ADD COLUMN telegram_id INTEGER")
 
-        columns = connection.execute(
-            "PRAGMA table_info(bookings)"
-        ).fetchall()
 
-        column_names = [column[1] for column in columns]
-
-        if "telegram_id" not in column_names:
-            connection.execute(
-                "ALTER TABLE bookings ADD COLUMN telegram_id INTEGER"
-            )
+def _busy_times(connection, date):
+    return [row[0] for row in connection.execute(
+        "SELECT time FROM bookings WHERE date = ? ORDER BY time", (date,)
+    )]
 
 
 def add_booking(name, service, date, time, telegram_id=None):
-    name = name.strip()
-    service = service.strip()
-    date = date.strip()
-    time = time.strip()
-
+    name, service, date, time = name.strip(), service.strip(), date.strip(), time.strip()
     if not name:
         return "❌ Укажите имя клиента!"
-
     if service not in SERVICES:
         return "❌ Такой услуги нет в нашем салоне!"
-
     try:
-        booking_date = datetime.strptime(
-            date, "%d.%m.%Y"
-        ).date()
+        booking_date = _parse_date(date)
+        booking_time = _parse_time(time)
     except ValueError:
-        return "❌ Неверная дата! Используйте ДД.ММ.ГГГГ."
+        return "❌ Проверьте дату ДД.ММ.ГГГГ и время ЧЧ:ММ."
 
-    if date != booking_date.strftime("%d.%m.%Y"):
-        return "❌ Неверная дата! Используйте ДД.ММ.ГГГГ."
-
-    try:
-        booking_time = datetime.strptime(
-            time, "%H:%M"
-        ).time()
-    except ValueError:
-        return "❌ Неверное время! Используйте ЧЧ:ММ."
-
-    if time != booking_time.strftime("%H:%M"):
-        return "❌ Неверное время! Используйте ЧЧ:ММ."
-
-    booking_datetime = datetime.combine(
-        booking_date, booking_time
-    )
-    booking_end = booking_datetime + DURATION
-
-    opening = datetime.combine(
-        booking_date,
-        datetime.strptime("09:00", "%H:%M").time()
-    )
-
-    closing = datetime.combine(
-        booking_date,
-        datetime.strptime("20:00", "%H:%M").time()
-    )
-
-    if booking_datetime < opening or booking_end > closing:
+    start = datetime.combine(booking_date, booking_time)
+    end = start + DURATION
+    opening = datetime.combine(booking_date, _parse_time(OPEN_TIME))
+    closing = datetime.combine(booking_date, _parse_time(CLOSE_TIME))
+    if start < opening or end > closing:
         return "❌ Процедура должна проходить с 09:00 до 20:00!"
-
-    if booking_datetime <= salon_now():
+    if start <= salon_now():
         return "❌ Нельзя записаться на прошедшую дату или время!"
 
     try:
         with sqlite3.connect(DB_PATH, timeout=10) as connection:
             connection.execute("BEGIN IMMEDIATE")
-
-            existing_times = connection.execute(
-                """
-                SELECT time
-                FROM bookings
-                WHERE date = ?
-                """,
-                (date,)
-            ).fetchall()
-
-            for (existing_time,) in existing_times:
-                existing_start = datetime.combine(
-                    booking_date,
-                    datetime.strptime(
-                        existing_time, "%H:%M"
-                    ).time()
-                )
-
-                existing_end = existing_start + DURATION
-
-                if (
-                    booking_datetime < existing_end
-                    and existing_start < booking_end
-                ):
+            for busy in _busy_times(connection, date):
+                busy_start = datetime.combine(booking_date, _parse_time(busy))
+                if start < busy_start + DURATION and busy_start < end:
                     return "❌ Это время занято. Выберите другое."
-
             connection.execute(
-                """
-                INSERT INTO bookings
-                (name, service, date, time, telegram_id)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (name, service, date, time, telegram_id)
+                "INSERT INTO bookings (name, service, date, time, telegram_id) VALUES (?, ?, ?, ?, ?)",
+                (name, service, date, time, telegram_id),
             )
-
         return f"✅ Клиент {name} успешно записан!"
-
     except sqlite3.IntegrityError:
         return "❌ Это время уже занято!"
-
     except sqlite3.OperationalError:
         return "❌ База временно недоступна. Попробуйте позже."
 
 
 def get_bookings():
     with sqlite3.connect(DB_PATH) as connection:
+        return connection.execute("SELECT name, service, date, time FROM bookings ORDER BY id").fetchall()
+
+
+def get_user_bookings(telegram_id):
+    with sqlite3.connect(DB_PATH) as connection:
         return connection.execute(
-            """
-            SELECT name, service, date, time
-            FROM bookings
-            ORDER BY id
-            """
+            "SELECT id, name, service, date, time FROM bookings WHERE telegram_id = ? ORDER BY id",
+            (telegram_id,),
         ).fetchall()
 
 
 def cancel_booking(booking_id, telegram_id):
     with sqlite3.connect(DB_PATH) as connection:
         cursor = connection.execute(
-            """
-            DELETE FROM bookings
-            WHERE id = ? AND telegram_id = ?
-            """,
-            (booking_id, telegram_id)
+            "DELETE FROM bookings WHERE id = ? AND telegram_id = ?", (booking_id, telegram_id)
         )
-
-        if cursor.rowcount == 0:
-            return "❌ Запись не найдена или принадлежит другому клиенту."
-
-        return "✅ Запись успешно отменена!"
-
-
-def get_user_bookings(telegram_id):
-    with sqlite3.connect(DB_PATH) as connection:
-        return connection.execute(
-            """
-            SELECT id, name, service, date, time
-            FROM bookings
-            WHERE telegram_id = ?
-            ORDER BY id
-            """,
-            (telegram_id,)
-        ).fetchall()
+        return "✅ Запись успешно отменена!" if cursor.rowcount else "❌ Запись не найдена или принадлежит другому клиенту."
 
 
 def get_busy_times(date):
     with sqlite3.connect(DB_PATH) as connection:
-        rows = connection.execute(
-            """
-            SELECT time
-            FROM bookings
-            WHERE date = ?
-            ORDER BY time
-            """,
-            (date,)
-        ).fetchall()
-
-    return [row[0] for row in rows]
+        return _busy_times(connection, date)
 
 
 def get_free_times(date):
     try:
-        booking_date = datetime.strptime(
-            date, "%d.%m.%Y"
-        ).date()
+        booking_date = _parse_date(date)
     except ValueError:
         return []
-
-    if date != booking_date.strftime("%d.%m.%Y"):
-        return []
-
-    busy_times = get_busy_times(date)
-    free_times = []
-
-    current = datetime.combine(
-        booking_date,
-        datetime.strptime("09:00", "%H:%M").time()
-    )
-
-    closing = datetime.combine(
-        booking_date,
-        datetime.strptime("20:00", "%H:%M").time()
-    )
-
+    with sqlite3.connect(DB_PATH) as connection:
+        busy_times = _busy_times(connection, date)
+    result = []
+    current = datetime.combine(booking_date, _parse_time(OPEN_TIME))
+    closing = datetime.combine(booking_date, _parse_time(CLOSE_TIME))
     now = salon_now()
-
     while current + DURATION <= closing:
         slot_end = current + DURATION
-
         overlap = any(
-            current < datetime.combine(
-                booking_date,
-                datetime.strptime(t, "%H:%M").time()
-            ) + DURATION
-            and
-            datetime.combine(
-                booking_date,
-                datetime.strptime(t, "%H:%M").time()
-            ) < slot_end
-            for t in busy_times
+            current < datetime.combine(booking_date, _parse_time(busy)) + DURATION
+            and datetime.combine(booking_date, _parse_time(busy)) < slot_end
+            for busy in busy_times
         )
-
         if not overlap and current > now:
-            free_times.append(current.strftime("%H:%M"))
-
+            result.append(current.strftime("%H:%M"))
         current += DURATION
-
-    return free_times
+    return result
 
 
 init_db()
-
-
-if __name__ == "__main__":
-    print("✅ База данных готова!")
-    print("Записи:", get_bookings())
