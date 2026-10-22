@@ -1,0 +1,18 @@
+# Секретные данные
+.env
+.env.*
+!.env.example
+
+# База клиентов
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+
+# Виртуальное окружение
+.venv/
+venv/
