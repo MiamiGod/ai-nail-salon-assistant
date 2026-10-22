@@ -7,7 +7,7 @@ from openai import AsyncOpenAI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from nail_database import SERVICES, add_booking, cancel_booking, get_bookings, get_free_times, get_user_bookings
+from nail_database import SERVICES, add_booking, cancel_booking, get_bookings, get_free_times, get_user_bookings, get_pending_reminders
 
 SALON_TZ = timezone(timedelta(hours=7))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -164,8 +164,51 @@ async def ai_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Ошибка AI"); await update.message.reply_text("⚠️ Временная ошибка AI. Попробуйте позже.")
 
 
+async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
+    import sqlite3
+
+    bookings = get_pending_reminders()
+
+    for booking in bookings:
+        booking_id, name, service, date, time, telegram_id = booking
+
+        message = (
+            f"💅 Напоминание о записи!\n\n"
+            f"👤 {name}\n"
+            f"💅 Услуга: {service}\n"
+            f"📅 Дата: {date}\n"
+            f"🕒 Время: {time}\n\n"
+            f"Ждём вас! ❤️"
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text=message
+            )
+
+            with sqlite3.connect("nail_bookings.db") as conn:
+                conn.execute(
+                    "UPDATE bookings SET reminder_sent = 1 WHERE id = ?",
+                    (booking_id,)
+                )
+
+            logger.info("Напоминание отправлено: запись %s", booking_id)
+
+        except Exception:
+            logger.exception(
+                "Ошибка отправки напоминания для записи %s",
+                booking_id
+            )
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+    app.job_queue.run_repeating(
+    send_reminders,
+    interval=60,
+    first=10,
+    name="booking_reminders"
+)
     app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("book", book)); app.add_handler(CommandHandler("bookings", show_bookings)); app.add_handler(CommandHandler("cancel", cancel)); app.add_handler(CommandHandler("confirm_cancel", confirm_cancel)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_reply))
     print("✅ Telegram AI-бот запущен!", flush=True)
     app.run_polling()

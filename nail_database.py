@@ -147,3 +147,32 @@ def get_free_times(date):
 
 
 init_db()
+
+def get_pending_reminders():
+    import sqlite3
+    from datetime import timedelta
+
+    now = salon_now()
+    window_end = now + timedelta(hours=24)
+
+    with sqlite3.connect("nail_bookings.db") as conn:
+        rows = conn.execute("""
+            SELECT id, name, service, date, time, telegram_id
+            FROM bookings
+            WHERE reminder_sent = 0
+              AND telegram_id IS NOT NULL
+        """).fetchall()
+
+    pending = []
+
+    for row in rows:
+        booking_id, name, service, date, time, telegram_id = row
+
+        booking_datetime = datetime.strptime(
+            f"{date} {time}", "%d.%m.%Y %H:%M"
+        )
+
+        if now < booking_datetime <= window_end:
+            pending.append(row)
+
+    return pending
